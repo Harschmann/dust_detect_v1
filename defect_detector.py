@@ -82,6 +82,7 @@ DEFAULT_PARAMS = dict(
     texture_enabled=True,    # the same-color-scratch channel
     suppress_colored=False,  # ignore strongly colored (saturated) areas entirely
     saturation_threshold=25, # "colored" if S exceeds the ROI median S by this much
+    white_max_saturation=60, # HARD gate: pixels with HSV saturation above this are "colored", never a defect (dust/thread/glue are white=low sat)
     local_mean_window=0,     # 0 = auto (scales with each ROI's radius); >0 forces a fixed px window
     elongation_thread=3.5,   # minAreaRect long/short ratio => thread
 )
@@ -182,6 +183,38 @@ def _analyze_roi(gray_f32, sat_u8, cx, cy, r_analysis, p):
     z_int[inside] = (detr[inside] - med) / scale
     int_mask = ((z_int > p["sigma_intensity"]) & inside).astype(np.uint8) * 255
 
+    # ---- HARD WHITE-ONLY GATE (always on).
+    # Real defects - dust, thread, glue - are white/gray, i.e. LOW color
+    # saturation. Anything meaningfully colored (blue/green AR coating
+    # reflections, yellow glare) is NOT a defect, however bright it looks
+    # once flattened to grayscale. So any pixel whose saturation exceeds
+    # an absolute threshold is removed from the intensity mask outright.
+    # This is what stops colored coating reflections being called "dust".
+    #
+    # The colored region is DILATED before gating: the resolution pre-blur
+    # spreads a colored patch's brightness a few px into its lower-
+    # saturation border, and those border pixels would otherwise slip
+    # through the gate (bright AND technically low-saturation) as a fake
+    # thin "thread" ring around the patch. Dilating past the blur radius
+    # kills that halo.
+    if sat_u8 is not None:
+        # Colored AR reflections are soft-edged: saturation falls off
+        # gradually, so a hard per-pixel threshold leaves a bright,
+        # just-under-threshold rim that then reads as a thin "thread"
+        # around the patch. To kill that reliably: (a) blur the
+        # saturation map so the whole falloff zone registers, (b) treat
+        # anything above the threshold as colored, then (c) dilate well
+        # past the intensity pre-blur radius. A real white defect sits in
+        # genuinely zero-saturation surroundings, so this never touches it.
+        sat_blur = cv2.GaussianBlur(sat_u8.astype(np.float32), (0, 0), 3.0)
+        is_colored = (sat_blur > p["white_max_saturation"]) & inside
+        grow = max(9, int(round(r_analysis * 0.05)))
+        if grow % 2 == 0:
+            grow += 1
+        gate = cv2.dilate((is_colored.astype(np.uint8) * 255),
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow))) > 0
+        int_mask[gate] = 0
+
     colored = None
     colored_tex = None
     if p["suppress_colored"] and sat_u8 is not None:
@@ -216,6 +249,18 @@ def _analyze_roi(gray_f32, sat_u8, cx, cy, r_analysis, p):
         gmed, gscale = _robust_center_scale(gvals)
         z_tex[inside] = (gmag[inside] - gmed) / gscale
         tex_mask = ((z_tex > p["sigma_texture"]) & inside).astype(np.uint8) * 255
+        # same hard white-only gate on the texture channel, but WIDER: a
+        # soft colored reflection's gradient ring extends well past its
+        # saturated core (the faint edge has low saturation yet still
+        # produces gradient), so it needs a more generous colored margin
+        # than the intensity channel to avoid a fake "scratch" ring.
+        if sat_u8 is not None:
+            tex_grow = max(21, int(round(r_analysis * 0.12)))
+            if tex_grow % 2 == 0:
+                tex_grow += 1
+            tex_gate = cv2.dilate((is_colored.astype(np.uint8) * 255),
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tex_grow, tex_grow))) > 0
+            tex_mask[tex_gate] = 0
         if colored_tex is not None:
             tex_mask[colored_tex] = 0
 
@@ -285,9 +330,12 @@ def run_full_inspection(frame, rois, params=None, make_heatmap=False):
 
     if frame.ndim == 3:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        sat = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 1] if p["suppress_colored"] else None
+        # saturation is always needed now for the hard white-only gate
+        sat = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 1]
         annotated = frame.copy()
     else:
+        # a grayscale frame has no color info, so nothing can be "colored"
+        # - the white gate is a no-op and every bright spot is eligible
         gray = frame
         sat = None
         annotated = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
