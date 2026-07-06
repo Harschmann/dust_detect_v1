@@ -10,12 +10,18 @@ Why v2 - three real weaknesses of the plain global Z-score:
     own tail). v2 uses median + MAD (median absolute deviation), which
     barely move even when a defect covers a few % of the ROI.
 
-2.  LOCAL DETREND. Real lenses vignette - the rim is darker than the
-    center even when perfectly clean. A single global mean makes the
-    rim look "dark-anomalous" and the center "bright-anomalous". v2
-    subtracts a masked local mean (boxFilter) first, so only *local*
-    deviations count. This is the boxFilter idea from the production
-    line algo, kept.
+2.  LOCAL DETREND, ONE-SIDED. Real lenses vignette - the rim is darker
+    than the center even when perfectly clean. A single global mean
+    makes the rim look "dark-anomalous". v2 subtracts a masked local
+    mean (boxFilter) first, so only *local* deviations count - and
+    only checks the BRIGHT side. Dust, thread, and glue are all
+    white/bright against the module surface, and in some models the
+    coating itself already looks whitish (that's exactly why this is a
+    relative z-score check, not a fixed brightness cutoff - only a spot
+    brighter than its own local surroundings counts). Dark deviations
+    are never the actual defect here, so they're not flagged at all -
+    this also quietly drops a lot of false alarms from lighting
+    artifacts that have a dark side (shadows, the dim side of an arc).
 
 3.  TEXTURE CHANNEL for same-color scratches. A scratch in the AR
     coating can have the SAME average brightness as the coating around
@@ -34,6 +40,18 @@ Every surviving blob is classified:
 Note: glue residue is white and compact, so it lands in "dust" - a
 reliable glue-vs-dust split needs the circularity / stroke-width logic
 and isn't attempted here. Everything found counts toward NG either way.
+
+KNOWN OPEN ISSUE (not attempted here, revisit later): some models show
+curved lighting-reflection arcs and/or concentric rings from the lens's
+own construction, both fixed patterns tied to radius from the ROI
+center rather than real defects. A radial-symmetry baseline was tried
+and reverted - it starves for pixels near the ROI center (a real dust
+speck there can dominate its own radius bin and hide itself) and
+assumes the lighting is perfectly axi-symmetric, which real jigs often
+aren't - both made real-photo detection worse, not better. Fixing the
+arc/ring false-positives properly needs its own pass (e.g. a golden-
+reference frame per model to subtract, since that cancels any fixed
+pattern - radial, arc-shaped, or not - without these failure modes).
 
 Optional extras:
     - edge margin: shrink each ROI a few px so the lens rim's natural
@@ -64,7 +82,7 @@ DEFAULT_PARAMS = dict(
     texture_enabled=True,    # the same-color-scratch channel
     suppress_colored=False,  # ignore strongly colored (saturated) areas entirely
     saturation_threshold=25, # "colored" if S exceeds the ROI median S by this much
-    local_mean_window=101,   # boxFilter window for detrending (odd)
+    local_mean_window=0,     # 0 = auto (scales with each ROI's radius); >0 forces a fixed px window
     elongation_thread=3.5,   # minAreaRect long/short ratio => thread
 )
 
@@ -96,6 +114,12 @@ def _robust_center_scale(values):
 
 
 def _masked_local_mean(img_f32, mask_f32, window):
+    """boxFilter local mean, masked to the ROI. Models slowly-varying
+    background (vignetting, gentle lighting falloff) at the scale of
+    `window`, without needing full radial symmetry - unlike a pure
+    radius-based baseline, this still works if lighting isn't axi-
+    symmetric, and doesn't risk a real defect near the ROI center
+    dominating its own (tiny-population) radius bin and hiding itself."""
     k = (window, window)
     num = cv2.boxFilter(img_f32 * mask_f32, -1, k, normalize=False)
     den = cv2.boxFilter(mask_f32, -1, k, normalize=False)
@@ -130,16 +154,33 @@ def _analyze_roi(gray_f32, sat_u8, cx, cy, r_analysis, p):
     inside = mask > 0
     if int(np.count_nonzero(inside)) < 100:
         return [], None, None, mask
-    mask_f = (mask.astype(np.float32)) / 255.0
 
-    # ---- intensity channel: detrend, then robust z
-    local_mean = _masked_local_mean(gray_f32, mask_f, p["local_mean_window"])
-    detr = (gray_f32 - local_mean)
+    # ---- intensity channel: local detrend, then robust z - ONE-SIDED
+    # (bright only). Dust, thread, and glue are all white/bright against
+    # the module surface; the coating itself can look whitish too, which
+    # is exactly why this is a relative (z-score) check and not a fixed
+    # brightness cutoff - only a spot that's brighter than its own local
+    # surroundings counts. Dark deviations are intentionally ignored:
+    # they're never the defect here, only ever noise or a lighting
+    # artifact's shadow side.
+    win = int(p["local_mean_window"])
+    if win <= 0:
+        # auto: tie the detrend window to this lens's size in pixels, so
+        # it works at any camera resolution. ~0.6x radius is far larger
+        # than any dust speck or thread width (those survive the detrend)
+        # but small enough to still flatten lens-scale lighting falloff.
+        win = int(round(r_analysis * 0.6))
+    win = max(15, win)
+    if win % 2 == 0:
+        win += 1
+    mask_f = (mask.astype(np.float32)) / 255.0
+    local_mean = _masked_local_mean(gray_f32, mask_f, win)
+    detr = gray_f32 - local_mean
     vals = detr[inside]
     med, scale = _robust_center_scale(vals)
     z_int = np.zeros_like(gray_f32)
     z_int[inside] = (detr[inside] - med) / scale
-    int_mask = ((np.abs(z_int) > p["sigma_intensity"]) & inside).astype(np.uint8) * 255
+    int_mask = ((z_int > p["sigma_intensity"]) & inside).astype(np.uint8) * 255
 
     colored = None
     colored_tex = None
@@ -156,7 +197,9 @@ def _analyze_roi(gray_f32, sat_u8, cx, cy, r_analysis, p):
         colored_u8 = colored.astype(np.uint8) * 255
         colored_tex = cv2.dilate(colored_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))) > 0
 
-    # ---- texture channel: Scharr gradient magnitude, robust z
+    # ---- texture channel: Scharr gradient magnitude, robust z (kept as
+    # validated before - deprioritized for now, revisit with the arc/ring
+    # problem later)
     z_tex = np.zeros_like(gray_f32)
     tex_mask = np.zeros((h, w), dtype=np.uint8)
     if p["texture_enabled"]:
@@ -250,6 +293,20 @@ def run_full_inspection(frame, rois, params=None, make_heatmap=False):
         annotated = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
     gray_f32 = gray.astype(np.float32)
+
+    # Resolution-scaled pre-blur: coating grain that's just sensor/surface
+    # texture produces per-pixel speckle that lights up the z-score at
+    # high resolution. A blur proportional to resolution smooths that
+    # grain (a real dust speck is many pixels and survives) so we don't
+    # drown in tiny false detects. Reference resolution is 1280px wide -
+    # at/below that this is a no-op, matching the tuned low-res behavior.
+    res_scale = max(gray.shape[0], gray.shape[1]) / 1280.0
+    kb = int(round(res_scale))
+    if kb % 2 == 0:
+        kb += 1
+    if kb >= 3:
+        gray_f32 = cv2.GaussianBlur(gray_f32, (kb, kb), 0)
+
     result = DetectionResult()
     score = np.zeros_like(gray_f32) if make_heatmap else None
 
@@ -292,4 +349,3 @@ def run_full_inspection(frame, rois, params=None, make_heatmap=False):
         base = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         result.heatmap = cv2.addWeighted(base, 0.35, heat, 0.65, 0)
     return result
-
