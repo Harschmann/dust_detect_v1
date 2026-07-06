@@ -28,7 +28,7 @@ from datetime import datetime
 
 import cv2
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 
 from camera_manager import CameraManager
 from defect_detector import run_full_inspection, DEFAULT_PARAMS
@@ -69,6 +69,8 @@ class App(ctk.CTk):
         self._param_widgets = {}      # key -> (value_label, fmt, var)
         self._lab = None
         self._last_result_win = None
+        self.static_image = None      # loaded-from-disk BGR frame, overrides live feed when set
+        self.static_name = ""
 
         self.current_model = ctk.StringVar(value="")
         self.sigma_intensity = ctk.DoubleVar(value=DEFAULT_PARAMS["sigma_intensity"])
@@ -126,6 +128,12 @@ class App(ctk.CTk):
         ctk.CTkButton(top, text="\U0001F9EA Tuning Lab", width=120, fg_color="transparent",
                       border_width=1, border_color=ACCENT, text_color=ACCENT, hover_color="#1f3a42",
                       command=self._open_lab).pack(side="right", padx=6)
+        self.back_live_btn = ctk.CTkButton(top, text="\U0001F534 Back to Live Feed", width=160,
+                      fg_color="transparent", border_width=1, border_color=MUTED, hover_color="#262a2f",
+                      command=self._back_to_live)
+        ctk.CTkButton(top, text="\U0001F4C1 Open Image", width=140, fg_color="transparent",
+                      border_width=1, border_color=MUTED, hover_color="#262a2f",
+                      command=self._open_image_file).pack(side="right", padx=6)
 
         canvas_frame = ctk.CTkFrame(self, corner_radius=0, fg_color=BG)
         canvas_frame.grid(row=1, column=0, sticky="nsew")
@@ -216,10 +224,11 @@ class App(ctk.CTk):
                      self.edge_margin, 0, 40, lambda v: str(int(v)), steps=40)
 
         self._section(parent, "Inspect")
-        ctk.CTkButton(parent, text="\U0001F4F8  CAPTURE & INSPECT", height=46, fg_color=ACCENT,
-                      hover_color=ACCENT_HOVER, text_color="#0c1114",
+        self.capture_btn = ctk.CTkButton(parent, text="\U0001F4F8  CAPTURE & INSPECT", height=46,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#0c1114",
                       font=ctk.CTkFont(size=14, weight="bold"),
-                      command=self._capture_and_inspect).pack(fill="x", padx=6, pady=4)
+                      command=self._capture_and_inspect)
+        self.capture_btn.pack(fill="x", padx=6, pady=4)
 
         self._section(parent, "Stats (human-confirmed)")
         self.stats_label = ctk.CTkLabel(parent, text="No captures yet", justify="left", anchor="w",
@@ -369,6 +378,37 @@ class App(ctk.CTk):
         self.view_state.zoom_at(self.live_canvas.winfo_width() / 2,
                                  self.live_canvas.winfo_height() / 2, 1 / 1.2)
 
+    # ======================================================= image source
+    def _open_image_file(self):
+        path = filedialog.askopenfilename(
+            title="Open an already-captured image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("All files", "*.*")])
+        if not path:
+            return
+        self._load_image_path(path)
+
+    def _load_image_path(self, path):
+        """Loads a static image from disk and switches the live canvas into
+        static mode: same ROI click/zoom/pan controls, just frozen on this
+        file instead of the live feed, until Back to Live is pressed."""
+        img = cv2.imread(path)
+        if img is None:
+            messagebox.showerror("Load failed", f"Ye file image ki tarah nahi khuli:\n{path}")
+            return False
+        self.static_image = img
+        self.static_name = os.path.basename(path)
+        self.back_live_btn.pack(side="right", padx=6)
+        self.capture_btn.configure(text="\U0001F50D  INSPECT THIS IMAGE")
+        self.after(20, self.live_canvas.fit_to_window)
+        return True
+
+    def _back_to_live(self):
+        self.static_image = None
+        self.static_name = ""
+        self.back_live_btn.pack_forget()
+        self.capture_btn.configure(text="\U0001F4F8  CAPTURE & INSPECT")
+        self.after(20, self.live_canvas.fit_to_window)
+
     # ==================================================== capture + inspect
     def _on_space(self, _event):
         w = self.focus_get()
@@ -384,10 +424,13 @@ class App(ctk.CTk):
         if not self.rois:
             messagebox.showwarning("No ROI", "Kam se kam ek ROI point set karo (live feed pe click karke).")
             return
-        frame = self.camera.get_frame()
-        if frame is None:
-            messagebox.showwarning("No frame", "Camera se frame nahi mila.")
-            return
+        if self.static_image is not None:
+            frame = self.static_image
+        else:
+            frame = self.camera.get_frame()
+            if frame is None:
+                messagebox.showwarning("No frame", "Camera se frame nahi mila.")
+                return
         try:
             result = run_full_inspection(frame, self.rois, self.current_detect_params())
             saved = self.storage.save_capture(model, frame, result.annotated, result.verdict)
@@ -435,7 +478,7 @@ class App(ctk.CTk):
 
     # ========================================================= render loop
     def _tick(self):
-        frame = self.camera.get_frame()
+        frame = self.static_image if self.static_image is not None else self.camera.get_frame()
         if frame is not None:
             display = frame.copy()
             for i, r in enumerate(self.rois):
@@ -446,7 +489,10 @@ class App(ctk.CTk):
                 cv2.putText(display, str(i + 1), (center[0] - 6, center[1] - int(r["r"]) - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
             self.live_canvas.set_image(display)
-            self.status_label.configure(text=self.camera.status_text())
+            if self.static_image is not None:
+                self.status_label.configure(text=f"\U0001F5BC Static image: {self.static_name}")
+            else:
+                self.status_label.configure(text=self.camera.status_text())
         self.after(33, self._tick)
 
     def _on_close(self):
