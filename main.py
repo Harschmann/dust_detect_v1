@@ -80,6 +80,7 @@ class App(ctk.CTk):
         self.edge_margin = ctk.IntVar(value=DEFAULT_PARAMS["edge_margin_px"])
         self.texture_enabled = ctk.BooleanVar(value=DEFAULT_PARAMS["texture_enabled"])
         self.suppress_colored = ctk.BooleanVar(value=DEFAULT_PARAMS["suppress_colored"])
+        self.white_max_sat = ctk.IntVar(value=DEFAULT_PARAMS["white_max_saturation"])
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -96,6 +97,7 @@ class App(ctk.CTk):
             "edge_margin_px": int(self.edge_margin.get()),
             "texture_enabled": bool(self.texture_enabled.get()),
             "suppress_colored": bool(self.suppress_colored.get()),
+            "white_max_saturation": int(self.white_max_sat.get()),
         }
 
     def _apply_detect_params(self, p):
@@ -105,6 +107,7 @@ class App(ctk.CTk):
         self.edge_margin.set(int(p.get("edge_margin_px", DEFAULT_PARAMS["edge_margin_px"])))
         self.texture_enabled.set(bool(p.get("texture_enabled", DEFAULT_PARAMS["texture_enabled"])))
         self.suppress_colored.set(bool(p.get("suppress_colored", DEFAULT_PARAMS["suppress_colored"])))
+        self.white_max_sat.set(int(p.get("white_max_saturation", DEFAULT_PARAMS["white_max_saturation"])))
         self._refresh_param_labels()
 
     def _refresh_param_labels(self):
@@ -213,6 +216,8 @@ class App(ctk.CTk):
                      self.sigma_intensity, 1.5, 6.0, lambda v: f"{v:.1f}")
         self._slider(parent, "sigma_texture", "Texture sigma (same-color scratches)",
                      self.sigma_texture, 3.0, 9.0, lambda v: f"{v:.1f}")
+        self._slider(parent, "white_max_saturation", "White strictness (lower = only pure white counts)",
+                     self.white_max_sat, 20, 180, lambda v: str(int(v)))
         sw_row = ctk.CTkFrame(parent, fg_color="transparent")
         sw_row.pack(fill="x", padx=6, pady=(8, 0))
         ctk.CTkSwitch(sw_row, text="Scratch (texture) channel", variable=self.texture_enabled,
